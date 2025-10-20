@@ -1,0 +1,31 @@
+name: Release package
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure release artifact is executable
+        run: chmod +x xray-rp.sh
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: main-${{ github.run_number }}
+          name: Main release ${{ github.run_number }}
+          body: |
+            Automated release for commit ${{ github.sha }} on branch main.
+          files: |
+            xray-rp.sh
+          make_latest: true
