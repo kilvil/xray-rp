@@ -34,7 +34,8 @@ install_xray() {
   local tmp
   tmp="$(mktemp)"
   curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp"
-  bash "$tmp" @ install
+  # 直接以子命令方式调用安装脚本，避免特殊占位符参数引发兼容性问题
+  bash "$tmp" install
   rm -f "$tmp"
 }
 
@@ -361,7 +362,7 @@ uninstall_xray() {
   local tmp
   tmp="$(mktemp)"
   curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp"
-  bash "$tmp" @ remove
+  bash "$tmp" remove
   rm -f "$tmp"
   ok "已卸载 xray（保留配置）。如需彻底清理：再次执行并添加 --purge。"
 }
@@ -370,7 +371,7 @@ update_geodata() {
   local tmp
   tmp="$(mktemp)"
   curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp"
-  bash "$tmp" @ install-geodata
+  bash "$tmp" install-geodata
   rm -f "$tmp"
   ok "已更新 geosite/geoip"
 }
