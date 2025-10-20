@@ -30,8 +30,12 @@ ensure_tools() {
 }
 
 install_xray() {
-  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
-    | bash -s @ install
+  # 使用临时文件运行安装脚本，避免通过管道传参导致的 bash 选项解析异常
+  local tmp
+  tmp="$(mktemp)"
+  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp"
+  bash "$tmp" @ install
+  rm -f "$tmp"
 }
 
 ensure_layout() {
@@ -354,14 +358,20 @@ ENDJSON
 }
 
 uninstall_xray() {
-  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
-    | bash -s @ remove
+  local tmp
+  tmp="$(mktemp)"
+  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp"
+  bash "$tmp" @ remove
+  rm -f "$tmp"
   ok "已卸载 xray（保留配置）。如需彻底清理：再次执行并添加 --purge。"
 }
 
 update_geodata() {
-  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh \
-    | bash -s @ install-geodata
+  local tmp
+  tmp="$(mktemp)"
+  curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh -o "$tmp"
+  bash "$tmp" @ install-geodata
+  rm -f "$tmp"
   ok "已更新 geosite/geoip"
 }
 
