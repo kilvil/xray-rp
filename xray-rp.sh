@@ -8,6 +8,36 @@ XRAY_CFG_DIR="/usr/local/etc/xray"
 XRAY_CFG="${XRAY_CFG_DIR}/config.json"
 LOG_DIR="/var/log/xray"
 
+# REALITY 伪装域名池（随机抽取，用作 serverName/dest）
+declare -a REALITY_DOMAINS=(
+  "bleach.fandom.com"
+  "booth.pm"
+  "dragonball.fandom.com"
+  "fandom.com"
+  "mora.jp"
+  "mxj.myanimelist.net"
+  "naruto.fandom.com"
+  "nichijou.fandom.com"
+  "onepiece.fandom.com"
+  "pokemon.fandom.com"
+  "tidal.com"
+  "toarumajutsunoindex.fandom.com"
+  "www.fandom.com"
+  "www.ivi.tv"
+  "www.j-wave.co.jp"
+  "www.leercapitulo.co"
+  "www.lovelive-anime.jp"
+  "www.pixiv.co.jp"
+  "www.sky.com"
+)
+
+pick_reality_domain() {
+  local n=${#REALITY_DOMAINS[@]}
+  [[ $n -gt 0 ]] || { echo "tidal.com"; return; }
+  local idx=$((RANDOM % n))
+  echo "${REALITY_DOMAINS[$idx]}"
+}
+
 color() { local c="$1"; shift; printf "\033[%sm%s\033[0m\n" "$c" "$*"; }
 ok()    { color "32" "✔ $*"; }
 warn()  { color "33" "⚠ $*"; }
@@ -68,12 +98,13 @@ xray_validate() {
     return 1
   fi
   # 调用 Xray 进行配置校验，捕获详细输出
-  if ! out=$("$XRAY_BIN" run -test -c "$XRAY_CFG" 2>&1); then
-    status=$?
+  out=$("$XRAY_BIN" run -test -c "$XRAY_CFG" 2>&1) || status=$?
+  # 某些版本可能输出失败信息但退出码为 0，这里做内容兜底判断
+  if [[ $status -ne 0 || "$out" == *"Failed to start"* || "$out" == *"failed to build"* ]]; then
     err "配置校验失败（以下为 Xray -test 输出）："
     echo "$out"
     echo "配置文件路径: $XRAY_CFG"
-    return $status
+    return 1
   fi
   return 0
 }
@@ -101,14 +132,18 @@ gen_shortid() { openssl rand -hex 8; }
 # 生成 VLESS 加密/解密字符串（选择 PQ 或 X25519）
 gen_vlessenc() {
   local mode="$1" out enc dec
-  out="$("$XRAY_BIN" vlessenc)"
-  if [[ "$mode" == "pq" ]]; then
-    dec=$(awk '/Authentication: ML-KEM-768/{f=1} f&&/"decryption":/{gsub(/.*"decryption": "|".*/,""); print; exit}' <<<"$out")
-    enc=$(awk '/Authentication: ML-KEM-768/{f=1} f&&/"encryption":/{gsub(/.*"encryption": "|".*/,""); print; exit}' <<<"$out")
-  else
-    dec=$(awk '/Authentication: X25519/{f=1} f&&/"decryption":/{gsub(/.*"decryption": "|".*/,""); print; exit}' <<<"$out")
-    enc=$(awk '/Authentication: X25519/{f=1} f&&/"encryption":/{gsub(/.*"encryption": "|".*/,""); print; exit}' <<<"$out")
+  out="$("$XRAY_BIN" vlessenc 2>/dev/null || true)"
+  if [[ -n "$out" ]]; then
+    if [[ "$mode" == "pq" ]]; then
+      dec=$(awk '/Authentication: ML-KEM-768/{f=1} f&&/"decryption":/{gsub(/.*"decryption": "|".*/,""); print; exit}' <<<"$out")
+      enc=$(awk '/Authentication: ML-KEM-768/{f=1} f&&/"encryption":/{gsub(/.*"encryption": "|".*/,""); print; exit}' <<<"$out")
+    else
+      dec=$(awk '/Authentication: X25519/{f=1} f&&/"decryption":/{gsub(/.*"decryption": "|".*/,""); print; exit}' <<<"$out")
+      enc=$(awk '/Authentication: X25519/{f=1} f&&/"encryption":/{gsub(/.*"encryption": "|".*/,""); print; exit}' <<<"$out")
+    fi
   fi
+  [[ -z "$dec" ]] && dec="none"
+  [[ -z "$enc" ]] && enc="none"
   printf '%s;%s\n' "$dec" "$enc"
 }
 
@@ -128,8 +163,11 @@ make_portal() {
     warn "未能通过 Cloudflare Meta 检测公网IP，请手动输入。"
   fi
   addr=$(ask "Portal 公网域名或IP(将写入连接参数)" "$daddr")
-  sni_fwd=$(ask "正向(443) REALITY 的 SNI(serverName)" "tidal.com")
-  sni_rev=$(ask "反向(9443) REALITY 的 SNI(serverName)" "apple.com")
+  local def_sni_fwd def_sni_rev
+  def_sni_fwd="$(pick_reality_domain)"
+  def_sni_rev="$(pick_reality_domain)"
+  sni_fwd=$(ask "正向(443) REALITY 的 SNI(serverName)" "$def_sni_fwd")
+  sni_rev=$(ask "反向(9443) REALITY 的 SNI(serverName)" "$def_sni_rev")
   auth_choice=$(ask "VLESS 认证方案 [pq=后量子 / x25519=非PQ]" "pq")
   [[ "$auth_choice" == "pq" ]] && auth_mode="pq" || auth_mode="x25519"
 
@@ -200,7 +238,7 @@ make_portal() {
         "clients": [
           { "email":"bridge-rev","id":"$r_uuid","flow":"xtls-rprx-vision","reverse":{"tag":"r-outbound"} }
         ],
-        "decryption": "$v_dec"
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
@@ -287,6 +325,8 @@ make_bridge() {
   r_port=$(jq -r '.reverse.port' "$tmp")
   r_enc=$(jq -r '.reverse.encryption' "$tmp")
   r_flow=$(jq -r '.reverse.flow' "$tmp")
+  # 兼容：若未提供或为空，则回退为 none
+  if [[ -z "$r_enc" || "$r_enc" == "null" ]]; then r_enc="none"; fi
 
   # 是否要配置本地 Socks 正向上网（走 443）
   local with_socks; with_socks=$(ask "是否配置本地 Socks5(127.0.0.1:10808) 并走 Portal:443 正向代理? [y/n]" "y")
