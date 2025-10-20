@@ -29,6 +29,14 @@ ensure_tools() {
   $INSTALL curl jq openssl >/dev/null 2>&1 || $INSTALL curl jq openssl
 }
 
+# 通过 Cloudflare Meta 获取公网 IP（优先 IPv4/IPv6 原样返回）
+detect_public_addr() {
+  local meta ip
+  meta="$(curl -fsSL --connect-timeout 3 --max-time 5 https://speed.cloudflare.com/meta || true)"
+  ip="$(jq -r '.clientIp // empty' <<<"$meta" 2>/dev/null || true)"
+  printf '%s' "$ip"
+}
+
 install_xray() {
   # 使用临时文件运行安装脚本，避免通过管道传参导致的 bash 选项解析异常
   local tmp
@@ -48,8 +56,26 @@ bkp_cfg() {
   if [[ -f "$XRAY_CFG" ]]; then cp -a "$XRAY_CFG" "${XRAY_CFG}.bak.$(date +%Y%m%d%H%M%S)"; fi
 }
 
-xray_ok() {
-  "$XRAY_BIN" run -test -c "$XRAY_CFG" >/dev/null && return 0 || return 1
+# 校验配置，失败时打印详细错误输出与 JSON 语法检查结果
+xray_validate() {
+  local out status=0
+  # 先进行 JSON 语法预检查，尽早报告定位信息
+  if ! jq -e . "$XRAY_CFG" >/dev/null 2>&1; then
+    local jq_err
+    jq_err="$(jq . "$XRAY_CFG" 2>&1 | head -n 3 || true)"
+    err "配置 JSON 语法有误：$jq_err"
+    echo "配置文件路径: $XRAY_CFG"
+    return 1
+  fi
+  # 调用 Xray 进行配置校验，捕获详细输出
+  if ! out=$("$XRAY_BIN" run -test -c "$XRAY_CFG" 2>&1); then
+    status=$?
+    err "配置校验失败（以下为 Xray -test 输出）："
+    echo "$out"
+    echo "配置文件路径: $XRAY_CFG"
+    return $status
+  fi
+  return 0
 }
 
 restart_xray() {
@@ -94,8 +120,14 @@ ask() { # ask "提示" "默认值"
 make_portal() {
   need_root; detect_pm; ensure_tools; install_xray; ensure_layout; bkp_cfg
 
-  local addr sni_fwd sni_rev auth_choice auth_mode
-  addr=$(ask "Portal 公网域名或IP(将写入连接参数)" "")
+  local addr sni_fwd sni_rev auth_choice auth_mode daddr
+  daddr="$(detect_public_addr || true)"
+  if [[ -n "$daddr" ]]; then
+    ok "已从 Cloudflare Meta 检测到公网IP: $daddr"
+  else
+    warn "未能通过 Cloudflare Meta 检测公网IP，请手动输入。"
+  fi
+  addr=$(ask "Portal 公网域名或IP(将写入连接参数)" "$daddr")
   sni_fwd=$(ask "正向(443) REALITY 的 SNI(serverName)" "tidal.com")
   sni_rev=$(ask "反向(9443) REALITY 的 SNI(serverName)" "apple.com")
   auth_choice=$(ask "VLESS 认证方案 [pq=后量子 / x25519=非PQ]" "pq")
@@ -191,7 +223,7 @@ make_portal() {
 }
 EOF
 
-  if xray_ok; then ok "配置校验通过"; else err "配置校验失败"; exit 1; fi
+  if xray_validate; then ok "配置校验通过"; else exit 1; fi
   restart_xray
 
   # 输出连接参数（Bridge 脚本将解析）
@@ -347,14 +379,15 @@ ROUTE
 ENDJSON
   } > "$XRAY_CFG"
 
-  if xray_ok; then ok "配置校验通过"; else err "配置校验失败"; exit 1; fi
+  if xray_validate; then ok "配置校验通过"; else exit 1; fi
   restart_xray
 
   ok "Bridge 完成。现在："
   if [[ "$with_socks" == "y" || "$with_socks" == "Y" ]]; then
     echo "  * 本机 SOCKS5: 127.0.0.1:10808 (curl --socks5 127.0.0.1:10808 http://ip-api.com/json)"
   fi
-  echo "  * 反向隧道入口：访问 http://${paddr}:31234 会被转发到 Bridge 的 127.0.0.1:80"
+  local paddr_disp="$paddr"; [[ "$paddr" == *:* ]] && paddr_disp="[$paddr]"
+  echo "  * 反向隧道入口：访问 http://${paddr_disp}:31234 会被转发到 Bridge 的 127.0.0.1:80"
   echo "日志: tail -F /var/log/xray/error.log /var/log/xray/access.log"
 }
 
