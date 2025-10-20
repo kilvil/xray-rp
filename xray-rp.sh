@@ -83,7 +83,32 @@ ensure_layout() {
 }
 
 bkp_cfg() {
-  if [[ -f "$XRAY_CFG" ]]; then cp -a "$XRAY_CFG" "${XRAY_CFG}.bak.$(date +%Y%m%d%H%M%S)"; fi
+  if [[ -f "$XRAY_CFG" ]]; then
+    # 时间戳备份
+    cp -a "$XRAY_CFG" "${XRAY_CFG}.bak.$(date +%Y%m%d%H%M%S)"
+    # 固定名备份，满足“备份为 config.json.bak”的需求
+    cp -a "$XRAY_CFG" "${XRAY_CFG_DIR}/config.json.bak"
+  fi
+}
+
+# 安装/配置前的状态检测与提示
+report_existing_state() {
+  if [[ -x "$XRAY_BIN" ]]; then
+    local ver
+    ver=$("$XRAY_BIN" -version 2>/dev/null | head -n1 || true)
+    if [[ -n "$ver" ]]; then
+      warn "检测到已安装 Xray: ${ver}"
+    else
+      warn "检测到已安装 Xray 可执行文件"
+    fi
+  fi
+  if [[ -s "$XRAY_CFG" ]]; then
+    warn "检测到现有配置文件且非空：$XRAY_CFG。将备份为 config.json.bak"
+  elif [[ -f "$XRAY_CFG" ]]; then
+    warn "检测到现有配置文件但为空：$XRAY_CFG。将覆盖生成新配置"
+  else
+    ok "未发现现有配置文件，将生成新配置"
+  fi
 }
 
 # 校验配置，失败时打印详细错误输出与 JSON 语法检查结果
@@ -152,8 +177,24 @@ ask() { # ask "提示" "默认值"
   if [[ -n "$d" ]]; then read -rp "$p [$d]: " v; echo "${v:-$d}"; else read -rp "$p: " v; echo "$v"; fi
 }
 
+ask_port() { # ask_port "提示" 默认端口
+  local prompt="$1" def="${2:-80}" v
+  while true; do
+    if [[ -n "$def" ]]; then
+      read -rp "$prompt [$def]: " v; v="${v:-$def}"
+    else
+      read -rp "$prompt: " v
+    fi
+    # 允许纯数字的 1-65535
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= 65535 )); then
+      echo "$v"; return 0
+    fi
+    warn "端口无效，请输入 1-65535 的数字"
+  done
+}
+
 make_portal() {
-  need_root; detect_pm; ensure_tools; install_xray; ensure_layout; bkp_cfg
+  need_root; detect_pm; ensure_tools; install_xray; ensure_layout; report_existing_state; bkp_cfg
 
   local addr sni_fwd sni_rev auth_choice auth_mode daddr
   daddr="$(detect_public_addr || true)"
@@ -168,6 +209,11 @@ make_portal() {
   def_sni_rev="$(pick_reality_domain)"
   sni_fwd=$(ask "正向(443) REALITY 的 SNI(serverName)" "$def_sni_fwd")
   sni_rev=$(ask "反向(9443) REALITY 的 SNI(serverName)" "$def_sni_rev")
+  # 端口自定义：Portal 正向端口(默认443)、Portal 反向端口(默认9443)、隧道入口端口(默认31234)
+  local port_fwd port_rev tunnel_port
+  port_fwd=$(ask_port "Portal 正向端口(REALITY/VLESS, 客户端连接端口)" 443)
+  port_rev=$(ask_port "Portal 反向端口(REALITY/VLESS, Bridge 连接端口)" 9443)
+  tunnel_port=$(ask_port "隧道入口端口(通过 http://portal:此端口 访问 Bridge 本地服务)" 31234)
   auth_choice=$(ask "VLESS 认证方案 [pq=后量子 / x25519=非PQ]" "pq")
   [[ "$auth_choice" == "pq" ]] && auth_mode="pq" || auth_mode="x25519"
 
@@ -210,7 +256,7 @@ make_portal() {
     {
       "tag": "VLESS-Vision-REALITY",
       "listen": "0.0.0.0",
-      "port": 443,
+      "port": ${port_fwd},
       "protocol": "vless",
       "settings": {
         "clients": [{ "email":"vless@xtls.reality", "id":"$f_uuid", "flow":"xtls-rprx-vision", "level":0 }],
@@ -232,7 +278,7 @@ make_portal() {
     {
       "tag": "external-vless",
       "listen": "0.0.0.0",
-      "port": 9443,
+      "port": ${port_rev},
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -252,7 +298,7 @@ make_portal() {
         }
       }
     },
-    { "listen":"0.0.0.0", "port":31234, "protocol":"tunnel", "tag":"t-inbound" }
+    { "listen":"0.0.0.0", "port":${tunnel_port}, "protocol":"tunnel", "tag":"t-inbound" }
   ],
   "outbounds": [
     { "tag": "direct", "protocol": "freedom" },
@@ -271,9 +317,10 @@ EOF
 {
   "portal_addr": "${addr}",
   "auth": "${auth_mode}",
+  "tunnel_port": ${tunnel_port},
   "forward": {
     "address": "${addr}",
-    "port": 443,
+    "port": ${port_fwd},
     "id": "${f_uuid}",
     "serverName": "${sni_fwd}",
     "publicKey": "${f_pub}",
@@ -282,7 +329,7 @@ EOF
   },
   "reverse": {
     "address": "${addr}",
-    "port": 9443,
+    "port": ${port_rev},
     "id": "${r_uuid}",
     "serverName": "${sni_rev}",
     "publicKey": "${r_pub}",
@@ -298,7 +345,7 @@ JSON
 }
 
 make_bridge() {
-  need_root; detect_pm; ensure_tools; install_xray; ensure_layout; bkp_cfg
+  need_root; detect_pm; ensure_tools; install_xray; ensure_layout; report_existing_state; bkp_cfg
 
   warn "请粘贴从 Portal 输出的连接参数 JSON，粘贴结束后按 Ctrl-D："
   local tmp=$(mktemp)
@@ -307,9 +354,12 @@ make_bridge() {
 
   local paddr auth f_id f_sni f_pub f_sid f_port f_flow
   local r_id r_sni r_pub r_sid r_port r_enc r_flow
+  local p_tunnel_port
 
   paddr=$(jq -r '.portal_addr' "$tmp")
   auth=$(jq -r '.auth' "$tmp")
+  p_tunnel_port=$(jq -r '.tunnel_port // empty' "$tmp")
+  if [[ -z "$p_tunnel_port" || "$p_tunnel_port" == "null" ]]; then p_tunnel_port=31234; fi
   # forward (可选)
   f_id=$(jq -r '.forward.id' "$tmp")
   f_sni=$(jq -r '.forward.serverName' "$tmp")
@@ -343,11 +393,15 @@ HDR
     { "tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"udp":true} }
 INB
     fi
+    # 询问 Bridge 要映射的本地端口（默认 80）
+    local map_port
+    map_port=$(ask_port "Bridge 本地映射端口(将被 Portal 隧道访问)" 80)
+
     cat <<'MID'
   ],
   "outbounds": [
     { "protocol":"direct","tag":"default" },
-    { "protocol":"freedom","tag":"local-web","settings":{"redirect":"127.0.0.1:80"} },
+    { "protocol":"freedom","tag":"local-web","settings":{"redirect":"127.0.0.1:__MAP_PORT__"} },
 MID
     if [[ "$with_socks" == "y" || "$with_socks" == "Y" ]]; then
       # 正向代理出站
@@ -419,6 +473,9 @@ ROUTE
 ENDJSON
   } > "$XRAY_CFG"
 
+  # 替换占位符
+  sed -i "s/__MAP_PORT__/${map_port}/g" "$XRAY_CFG"
+
   if xray_validate; then ok "配置校验通过"; else exit 1; fi
   restart_xray
 
@@ -427,7 +484,8 @@ ENDJSON
     echo "  * 本机 SOCKS5: 127.0.0.1:10808 (curl --socks5 127.0.0.1:10808 http://ip-api.com/json)"
   fi
   local paddr_disp="$paddr"; [[ "$paddr" == *:* ]] && paddr_disp="[$paddr]"
-  echo "  * 反向隧道入口：访问 http://${paddr_disp}:31234 会被转发到 Bridge 的 127.0.0.1:80"
+  # 尽量获取与 Portal 一致的隧道端口显示（当 make_bridge 时无法得知 Portal 端，提示默认及本地映射端口）
+  echo "  * 反向隧道入口：访问 http://${paddr_disp}:${p_tunnel_port} 将被转发到 Bridge 的 127.0.0.1:${map_port}"
   echo "日志: tail -F /var/log/xray/error.log /var/log/xray/access.log"
 }
 
