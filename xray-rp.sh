@@ -209,11 +209,10 @@ make_portal() {
   def_sni_rev="$(pick_reality_domain)"
   sni_fwd=$(ask "正向(443) REALITY 的 SNI(serverName)" "$def_sni_fwd")
   sni_rev=$(ask "反向(9443) REALITY 的 SNI(serverName)" "$def_sni_rev")
-  # 端口自定义：Portal 正向端口(默认443)、Portal 反向端口(默认9443)、隧道入口端口(默认31234)
-  local port_fwd port_rev tunnel_port
+  # 端口自定义：Portal 正向端口(默认443)、Portal 反向端口(默认9443)
+  local port_fwd port_rev
   port_fwd=$(ask_port "Portal 正向端口(REALITY/VLESS, 客户端连接端口)" 443)
   port_rev=$(ask_port "Portal 反向端口(REALITY/VLESS, Bridge 连接端口)" 9443)
-  tunnel_port=$(ask_port "隧道入口端口(通过 http://portal:此端口 访问 Bridge 本地服务)" 31234)
   auth_choice=$(ask "VLESS 认证方案 [pq=后量子 / x25519=非PQ]" "pq")
   [[ "$auth_choice" == "pq" ]] && auth_mode="pq" || auth_mode="x25519"
 
@@ -223,17 +222,64 @@ make_portal() {
   f_short=$(gen_shortid)
   f_uuid=$(gen_uuid)
 
-  # 生成：9443(反向) 的 REALITY 密钥 + 短ID + 反向 UUID（Bridge 使用）
-  local r_priv r_pub r_short r_uuid
+  # 生成：9443(反向) 的 REALITY 密钥 + 短ID（所有隧道共享），每个隧道单独 UUID
+  local r_priv r_pub r_short
   IFS=';' read -r r_priv r_pub < <(gen_reality_keys)
   r_short=$(gen_shortid)
-  r_uuid=$(gen_uuid)
 
   # 生成 VLESS enc/dec（同一组：Portal入站用 decryption；Bridge出站用 encryption）
   local v_dec v_enc
   IFS=';' read -r v_dec v_enc < <(gen_vlessenc "$auth_mode")
 
-  # 写入 Portal 配置（含 API + 443 正向 + 9443 反向 + 31234 tunnel）
+  # 收集多隧道配置
+  local clients_json="" tunnels_inbounds_json="" route_tunnels_json="" tunnels_output_json=""
+  local i=1 ans="n" tunnel_port def_tunnel_port=31234 r_uuid
+  while true; do
+    tunnel_port=$(ask_port "隧道入口端口(通过 http://portal:此端口 访问 Bridge 本地服务)" "$def_tunnel_port")
+    r_uuid=$(gen_uuid)
+
+    # external-vless 的多客户端（每个隧道一个 reverse tag）
+    local c
+    c=$(cat <<EOC
+{ "email":"bridge-rev-${i}", "id":"${r_uuid}", "flow":"xtls-rprx-vision", "reverse":{"tag":"r-outbound-${i}"} }
+EOC
+)
+    if [[ -z "$clients_json" ]]; then clients_json="$c"; else clients_json="$clients_json, $c"; fi
+
+    # 对应的 tunnel inbound 与路由
+    local tinb rr
+    tinb=$(cat <<EOI
+{ "listen":"0.0.0.0", "port":${tunnel_port}, "protocol":"tunnel", "tag":"t-inbound-${i}" }
+EOI
+)
+    if [[ -z "$tunnels_inbounds_json" ]]; then tunnels_inbounds_json="$tinb"; else tunnels_inbounds_json="$tunnels_inbounds_json, $tinb"; fi
+
+    rr=$(cat <<EOR
+{ "inboundTag":["t-inbound-${i}"], "outboundTag":"r-outbound-${i}" }
+EOR
+)
+    if [[ -z "$route_tunnels_json" ]]; then route_tunnels_json="$rr"; else route_tunnels_json="$route_tunnels_json, $rr"; fi
+
+    # 输出 JSON 用：包含该隧道的全部信息
+    local tout
+    tout=$(cat <<EOJ
+{ "tunnel_port": ${tunnel_port}, "reverse": { "address": "${addr}", "port": ${port_rev}, "id": "${r_uuid}", "serverName": "${sni_rev}", "publicKey": "${r_pub}", "shortId": "${r_short}", "encryption": "${v_enc}", "flow": "xtls-rprx-vision" } }
+EOJ
+)
+    if [[ -z "$tunnels_output_json" ]]; then tunnels_output_json="$tout"; else tunnels_output_json="$tunnels_output_json, $tout"; fi
+
+    # 是否继续
+    ans=$(ask "是否继续添加下一个反向隧道? [y/N]" "n")
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+      i=$((i+1))
+      def_tunnel_port=$((tunnel_port+1))
+      continue
+    else
+      break
+    fi
+  done
+
+  # 写入 Portal 配置（含 API + 443 正向 + 9443 反向 + 多个 tunnel）
   cat > "$XRAY_CFG" <<EOF
 {
   "log": { "loglevel": "warning", "error": "$LOG_DIR/error.log", "access": "$LOG_DIR/access.log" },
@@ -245,7 +291,7 @@ make_portal() {
     "rules": [
       { "ruleTag":"api", "inboundTag":["api"], "outboundTag":"api" },
       { "ruleTag":"bt", "protocol":["bittorrent"], "outboundTag":"block" },
-      { "inboundTag":["t-inbound"], "outboundTag":"r-outbound" },
+      ${route_tunnels_json},
       { "ruleTag":"private-ip", "ip":["geoip:private"], "outboundTag":"block" },
       { "ruleTag":"cn-ip", "ip":["geoip:cn"], "outboundTag":"block" },
       { "ruleTag":"ad-domain", "domain":["geosite:category-ads-all"], "outboundTag":"block" }
@@ -281,9 +327,7 @@ make_portal() {
       "port": ${port_rev},
       "protocol": "vless",
       "settings": {
-        "clients": [
-          { "email":"bridge-rev","id":"$r_uuid","flow":"xtls-rprx-vision","reverse":{"tag":"r-outbound"} }
-        ],
+        "clients": [ ${clients_json} ],
         "decryption": "none"
       },
       "streamSettings": {
@@ -298,7 +342,7 @@ make_portal() {
         }
       }
     },
-    { "listen":"0.0.0.0", "port":${tunnel_port}, "protocol":"tunnel", "tag":"t-inbound" }
+    ${tunnels_inbounds_json}
   ],
   "outbounds": [
     { "tag": "direct", "protocol": "freedom" },
@@ -311,13 +355,17 @@ EOF
   restart_xray
 
   # 输出连接参数（Bridge 脚本将解析）
+  local first_tunnel_port first_reverse_id
+  first_tunnel_port=$(jq -r '.[0].tunnel_port' <<< "[${tunnels_output_json}]" 2>/dev/null || true)
+  first_reverse_id=$(jq -r '.[0].reverse.id'    <<< "[${tunnels_output_json}]" 2>/dev/null || true)
+
   cat <<JSON
 
 ================= 连接参数（请复制到 Bridge 脚本） =================
 {
   "portal_addr": "${addr}",
   "auth": "${auth_mode}",
-  "tunnel_port": ${tunnel_port},
+  "tunnel_port": ${first_tunnel_port:-31234},
   "forward": {
     "address": "${addr}",
     "port": ${port_fwd},
@@ -330,18 +378,19 @@ EOF
   "reverse": {
     "address": "${addr}",
     "port": ${port_rev},
-    "id": "${r_uuid}",
+    "id": "${first_reverse_id}",
     "serverName": "${sni_rev}",
     "publicKey": "${r_pub}",
     "shortId": "${r_short}",
     "encryption": "${v_enc}",
     "flow": "xtls-rprx-vision"
-  }
+  },
+  "tunnels": [ ${tunnels_output_json} ]
 }
 ===================================================================
 JSON
 
-  ok "Portal 完成。请把以上 JSON 原样复制，粘贴到 Bridge 脚本提示处。"
+  ok "Portal 完成。已生成多隧道参数。请把以上 JSON 原样复制，粘贴到 Bridge 脚本提示处。"
 }
 
 make_bridge() {
@@ -355,11 +404,13 @@ make_bridge() {
   local paddr auth f_id f_sni f_pub f_sid f_port f_flow
   local r_id r_sni r_pub r_sid r_port r_enc r_flow
   local p_tunnel_port
+  local tunnels_count
 
   paddr=$(jq -r '.portal_addr' "$tmp")
   auth=$(jq -r '.auth' "$tmp")
   p_tunnel_port=$(jq -r '.tunnel_port // empty' "$tmp")
   if [[ -z "$p_tunnel_port" || "$p_tunnel_port" == "null" ]]; then p_tunnel_port=31234; fi
+  tunnels_count=$(jq -r '(.tunnels | length) // 0' "$tmp")
   # forward (可选)
   f_id=$(jq -r '.forward.id' "$tmp")
   f_sni=$(jq -r '.forward.serverName' "$tmp")
@@ -367,114 +418,127 @@ make_bridge() {
   f_sid=$(jq -r '.forward.shortId' "$tmp")
   f_port=$(jq -r '.forward.port' "$tmp")
   f_flow=$(jq -r '.forward.flow' "$tmp")
-  # reverse
-  r_id=$(jq -r '.reverse.id' "$tmp")
-  r_sni=$(jq -r '.reverse.serverName' "$tmp")
-  r_pub=$(jq -r '.reverse.publicKey' "$tmp")
-  r_sid=$(jq -r '.reverse.shortId' "$tmp")
-  r_port=$(jq -r '.reverse.port' "$tmp")
-  r_enc=$(jq -r '.reverse.encryption' "$tmp")
-  r_flow=$(jq -r '.reverse.flow' "$tmp")
-  # 兼容：若未提供或为空，则回退为 none
-  if [[ -z "$r_enc" || "$r_enc" == "null" ]]; then r_enc="none"; fi
+  # 单隧道兼容（当 tunnels 为空时读取 legacy 字段）
+  if [[ "$tunnels_count" -eq 0 ]]; then
+    r_id=$(jq -r '.reverse.id' "$tmp")
+    r_sni=$(jq -r '.reverse.serverName' "$tmp")
+    r_pub=$(jq -r '.reverse.publicKey' "$tmp")
+    r_sid=$(jq -r '.reverse.shortId' "$tmp")
+    r_port=$(jq -r '.reverse.port' "$tmp")
+    r_enc=$(jq -r '.reverse.encryption' "$tmp")
+    r_flow=$(jq -r '.reverse.flow' "$tmp")
+    # 兼容：若未提供或为空，则回退为 none
+    if [[ -z "$r_enc" || "$r_enc" == "null" ]]; then r_enc="none"; fi
+  fi
 
   # 是否要配置本地 Socks 正向上网（走 443）
   local with_socks; with_socks=$(ask "是否配置本地 Socks5(127.0.0.1:10808) 并走 Portal:443 正向代理? [y/n]" "y")
 
-  # 生成 Bridge 配置
-  {
-    cat <<'HDR'
-{
-  "log": { "loglevel": "info", "error": "/var/log/xray/error.log", "access": "/var/log/xray/access.log" },
-  "inbounds": [
-HDR
-    if [[ "$with_socks" == "y" || "$with_socks" == "Y" ]]; then
-      cat <<'INB'
-    { "tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"udp":true} }
-INB
-    fi
-    # 询问 Bridge 要映射的本地端口（默认 80）
+  # 生成 Bridge 配置（支持多隧道）
+  local inbounds_json="" outbounds_json="" routes_json=""
+  # inbounds：可选 socks-in
+  if [[ "$with_socks" == "y" || "$with_socks" == "Y" ]]; then
+    inbounds_json='{ "tag":"socks-in","listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"udp":true} }'
+  fi
+
+  # outbounds：起始 direct 默认
+  outbounds_json='{ "protocol":"direct","tag":"default" }'
+
+  # forward 代理出站（可选）
+  if [[ "$with_socks" == "y" || "$with_socks" == "Y" ]]; then
+    local fwd_out
+    fwd_out=$(cat <<FWD
+{ "tag": "proxy", "protocol": "vless",
+  "settings": {
+    "vnext": [ { "address": "${paddr}", "port": ${f_port},
+      "users": [ { "id": "${f_id}", "encryption": "none", "flow": "${f_flow}" } ] } ]
+  },
+  "streamSettings": { "network": "tcp", "security": "reality",
+    "realitySettings": { "serverName": "${f_sni}", "publicKey": "${f_pub}", "shortId": "${f_sid}", "fingerprint": "chrome", "spiderX": "/" } },
+  "mux": { "enabled": false } }
+FWD
+)
+    outbounds_json="$outbounds_json, $fwd_out"
+  fi
+
+  if [[ "$tunnels_count" -gt 0 ]]; then
+    # 多隧道模式
+    local idx=0 def_map_port=80
+    while [[ $idx -lt $tunnels_count ]]; do
+      local t_port r_id_i r_sni_i r_pub_i r_sid_i r_port_i r_enc_i r_flow_i map_port_i
+      t_port=$(jq -r ".tunnels[$idx].tunnel_port" "$tmp")
+      r_id_i=$(jq -r ".tunnels[$idx].reverse.id" "$tmp")
+      r_sni_i=$(jq -r ".tunnels[$idx].reverse.serverName" "$tmp")
+      r_pub_i=$(jq -r ".tunnels[$idx].reverse.publicKey" "$tmp")
+      r_sid_i=$(jq -r ".tunnels[$idx].reverse.shortId" "$tmp")
+      r_port_i=$(jq -r ".tunnels[$idx].reverse.port" "$tmp")
+      r_enc_i=$(jq -r ".tunnels[$idx].reverse.encryption // \"none\"" "$tmp")
+      r_flow_i=$(jq -r ".tunnels[$idx].reverse.flow" "$tmp")
+
+      map_port_i=$(ask_port "Bridge 本地映射端口(供 Portal 隧道 ${t_port} 访问)" "$def_map_port")
+      def_map_port=$((map_port_i+1))
+
+      # 本地转发出站 & 反向出站
+      local local_web rev_link route
+      local_web=$(cat <<LWB
+{ "protocol":"freedom","tag":"local-web-${idx}","settings":{"redirect":"127.0.0.1:${map_port_i}"} }
+LWB
+)
+      rev_link=$(cat <<RVK
+{ "tag":"rev-link-${idx}", "protocol":"vless",
+  "settings": { "address": "${paddr}", "port": ${r_port_i}, "id": "${r_id_i}", "encryption": "${r_enc_i}", "flow": "${r_flow_i}", "reverse": { "tag": "r-inbound-${idx}" } },
+  "streamSettings": { "network": "tcp", "security": "reality",
+    "realitySettings": { "serverName": "${r_sni_i}", "publicKey": "${r_pub_i}", "shortId": "${r_sid_i}", "fingerprint": "chrome", "spiderX": "/" } },
+  "mux": { "enabled": false } }
+RVK
+)
+      route=$(cat <<RTE
+{ "type":"field", "inboundTag":["r-inbound-${idx}"], "outboundTag":"local-web-${idx}" }
+RTE
+)
+      outbounds_json="$outbounds_json, $local_web, $rev_link"
+      if [[ -z "$routes_json" ]]; then routes_json="$route"; else routes_json="$routes_json, $route"; fi
+
+      idx=$((idx+1))
+    done
+  else
+    # 兼容：单隧道模式
     local map_port
     map_port=$(ask_port "Bridge 本地映射端口(将被 Portal 隧道访问)" 80)
+    local local_web rev_link route
+    local_web=$(cat <<LWB1
+{ "protocol":"freedom","tag":"local-web","settings":{"redirect":"127.0.0.1:${map_port}"} }
+LWB1
+)
+    rev_link=$(cat <<RVK1
+{ "tag": "rev-link", "protocol": "vless",
+  "settings": { "address": "${paddr}", "port": ${r_port}, "id": "${r_id}", "encryption": "${r_enc}", "flow": "${r_flow}", "reverse": { "tag": "r-inbound" } },
+  "streamSettings": { "network": "tcp", "security": "reality",
+    "realitySettings": { "serverName": "${r_sni}", "publicKey": "${r_pub}", "shortId": "${r_sid}", "fingerprint": "chrome", "spiderX": "/" } },
+  "mux": { "enabled": false } }
+RVK1
+)
+    route='{ "type":"field", "inboundTag":["r-inbound"], "outboundTag":"local-web" }'
+    outbounds_json="$outbounds_json, $local_web, $rev_link"
+    routes_json="$route"
+  fi
 
-    cat <<'MID'
-  ],
-  "outbounds": [
-    { "protocol":"direct","tag":"default" },
-    { "protocol":"freedom","tag":"local-web","settings":{"redirect":"127.0.0.1:__MAP_PORT__"} },
-MID
-    if [[ "$with_socks" == "y" || "$with_socks" == "Y" ]]; then
-      # 正向代理出站
-      cat <<FWD
-    {
-      "tag": "proxy",
-      "protocol": "vless",
-      "settings": {
-        "vnext": [ { "address": "${paddr}", "port": ${f_port},
-          "users": [ { "id": "${f_id}", "encryption": "none", "flow": "${f_flow}" } ] } ]
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "serverName": "${f_sni}",
-          "publicKey": "${f_pub}",
-          "shortId": "${f_sid}",
-          "fingerprint": "chrome",
-          "spiderX": "/"
-        }
-      },
-      "mux": { "enabled": false }
-    },
-FWD
-    fi
-    # 反向出站（Bridge -> Portal:9443）
-    cat <<REV
-    {
-      "tag": "rev-link",
-      "protocol": "vless",
-      "settings": {
-        "address": "${paddr}",
-        "port": ${r_port},
-        "id": "${r_id}",
-        "encryption": "${r_enc}",
-        "flow": "${r_flow}",
-        "reverse": { "tag": "r-inbound" }
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "serverName": "${r_sni}",
-          "publicKey": "${r_pub}",
-          "shortId": "${r_sid}",
-          "fingerprint": "chrome",
-          "spiderX": "/"
-        }
-      },
-      "mux": { "enabled": false }
-    }
-REV
-    cat <<'TAIL'
-  ],
-  "routing": {
-    "rules": [
-      { "type":"field", "inboundTag":["r-inbound"], "outboundTag":"local-web" }
-TAIL
-    if [[ "$with_socks" == "y" || "$with_socks" == "Y" ]]; then
-      cat <<'ROUTE'
-      ,{ "type":"field", "inboundTag":["socks-in"], "outboundTag":"proxy" }
-ROUTE
-    fi
-    cat <<'ENDJSON'
-    ]
-  }
+  # with_socks 的路由
+  if [[ "$with_socks" == "y" || "$with_socks" == "Y" ]]; then
+    local rts
+    rts='{ "type":"field", "inboundTag":["socks-in"], "outboundTag":"proxy" }'
+    if [[ -z "$routes_json" ]]; then routes_json="$rts"; else routes_json="$routes_json, $rts"; fi
+  fi
+
+  # 写入完整配置
+  cat > "$XRAY_CFG" <<CFG
+{
+  "log": { "loglevel": "info", "error": "/var/log/xray/error.log", "access": "/var/log/xray/access.log" },
+  "inbounds": [ ${inbounds_json} ],
+  "outbounds": [ ${outbounds_json} ],
+  "routing": { "rules": [ ${routes_json} ] }
 }
-ENDJSON
-  } > "$XRAY_CFG"
-
-  # 替换占位符
-  sed -i "s/__MAP_PORT__/${map_port}/g" "$XRAY_CFG"
+CFG
 
   if xray_validate; then ok "配置校验通过"; else exit 1; fi
   restart_xray
@@ -484,8 +548,18 @@ ENDJSON
     echo "  * 本机 SOCKS5: 127.0.0.1:10808 (curl --socks5 127.0.0.1:10808 http://ip-api.com/json)"
   fi
   local paddr_disp="$paddr"; [[ "$paddr" == *:* ]] && paddr_disp="[$paddr]"
-  # 尽量获取与 Portal 一致的隧道端口显示（当 make_bridge 时无法得知 Portal 端，提示默认及本地映射端口）
-  echo "  * 反向隧道入口：访问 http://${paddr_disp}:${p_tunnel_port} 将被转发到 Bridge 的 127.0.0.1:${map_port}"
+  if [[ "$tunnels_count" -gt 0 ]]; then
+    # 输出每条隧道的入口提示
+    local idx=0
+    while [[ $idx -lt $tunnels_count ]]; do
+      local t_port_i
+      t_port_i=$(jq -r ".tunnels[$idx].tunnel_port" "$tmp")
+      echo "  * 反向隧道入口：访问 http://${paddr_disp}:${t_port_i} 将被转发到 Bridge 的本地映射端口"
+      idx=$((idx+1))
+    done
+  else
+    echo "  * 反向隧道入口：访问 http://${paddr_disp}:${p_tunnel_port} 将被转发到 Bridge 的本地服务"
+  fi
   echo "日志: tail -F /var/log/xray/error.log /var/log/xray/access.log"
 }
 
